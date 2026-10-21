@@ -2091,7 +2091,13 @@ JNIEXPORT jlong JNICALL NP(create)(
         }
         mpv_set_option_string(m, "vd-lavc-threads", "0");
         mpv_set_option_string(m, "target-colorspace-hint", "yes");
-        mpv_set_option_string(m, "target-colorspace-hint-mode", "source");
+        // Own-window mode tone-maps in mpv to the display the compositor
+        // describes ("target", mpv's default). In "source" mode mpv hands the
+        // compositor the stream's mastering metadata and blends the controls
+        // overlay into that HDR signal, so on KWin the controls came out at
+        // highlight brightness while the video was scaled down with the SDR
+        // reference (laptop brightness) and looked flat.
+        mpv_set_option_string(m, "target-colorspace-hint-mode", ownWindow ? "target" : "source");
 
         if (!headerFields.empty()) {
             mpv_set_option_string(m, "http-header-fields", headerFields.c_str());
