@@ -712,9 +712,13 @@ val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
         "bash", "-c",
         "c++ -std=c++17 -shared -fPIC -O2 " +
             "-I'$jni' -I'$jni/linux' " +
-            "$(pkg-config --cflags mpv webkit2gtk-4.1 gtk+-3.0 x11 xcomposite xext) " +
+            "$(pkg-config --cflags mpv webkit2gtk-4.1 gtk+-3.0 x11 xcomposite xext wayland-client) " +
             "'$src' -o '$out' " +
-            "$(pkg-config --libs mpv webkit2gtk-4.1 gtk+-3.0 x11 xcomposite xext) -lpthread",
+            // $ORIGIN: a libmpv bundled next to the bridge (patched for
+            // Wayland HDR mode, see scripts/linux/mpv-wayland-handles.patch)
+            // takes precedence over the system one.
+            "-Wl,-rpath,'\$ORIGIN' " +
+            "$(pkg-config --libs mpv webkit2gtk-4.1 gtk+-3.0 x11 xcomposite xext wayland-client) -lpthread",
     )
 }
 

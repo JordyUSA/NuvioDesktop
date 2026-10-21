@@ -74,6 +74,10 @@ modules:
               project-id: 5348
               stable-only: true
               url-template: https://github.com/mpv-player/mpv/archive/refs/tags/v$version.tar.gz
+          # wayland-display / wayland-surface properties: Linux HDR mode
+          # attaches the controls as an SDR subsurface of mpv's window.
+          - type: patch
+            path: mpv-wayland-handles.patch
         modules:
           - name: libXpresent
             buildsystem: autotools

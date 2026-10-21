@@ -1,0 +1,82 @@
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 24f9d7a..f8346e7 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -3063,6 +3063,14 @@ Property list
+     Read-only - mpv's window id. May not always be available, i.e due to window
+     not being opened yet or not being supported by the VO.
+ 
++``wayland-display``, ``wayland-surface``
++    Read-only - addresses of the ``wl_display`` connection and the toplevel
++    ``wl_surface`` of the Wayland VO, as int64 values. Only meaningful to libmpv
++    clients in the same process, e.g. to attach their own subsurfaces (such as
++    an SDR user interface over HDR video) to mpv's window. Clients must use
++    their own event queue on the display. Unavailable when the VO is not
++    Wayland based or no window exists yet.
++
+ ``display-swapchain``
+     Read-only - Direct3D 11 swapchain address. Returns an int64 type value
+     representing the memory address of the D3D11 swapchain. May not always be
+diff --git a/player/command.c b/player/command.c
+index 96bc06a..2bab7ac 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -1432,6 +1432,19 @@ static int mp_property_window_id(void *ctx, struct m_property *prop,
+     return m_property_int64_ro(action, arg, wid);
+ }
+ 
++static int mp_property_wayland_handle(void *ctx, struct m_property *prop,
++                                      int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct vo *vo = mpctx->video_out;
++    void *handle = NULL;
++    int request = strcmp(prop->name, "wayland-display") == 0
++                  ? VOCTRL_GET_WAYLAND_DISPLAY : VOCTRL_GET_WAYLAND_SURFACE;
++    if (!vo || vo_control(vo, request, &handle) <= 0 || !handle)
++        return M_PROPERTY_UNAVAILABLE;
++    return m_property_int64_ro(action, arg, (intptr_t)handle);
++}
++
+ static int mp_property_eof_reached(void *ctx, struct m_property *prop,
+                                    int action, void *arg)
+ {
+@@ -4410,6 +4423,8 @@ static const struct m_property mp_properties_base[] = {
+     {"deinterlace-active", mp_property_deinterlace},
+     {"idle-active", mp_property_idle},
+     {"window-id", mp_property_window_id},
++    {"wayland-display", mp_property_wayland_handle},
++    {"wayland-surface", mp_property_wayland_handle},
+     {"display-swapchain", mp_property_vo_display_swapchain},
+ 
+     {"chapter-list", mp_property_list_chapters},
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 160d860..a926742 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -119,6 +119,8 @@ enum mp_voctrl {
+     VOCTRL_GET_HIDPI_SCALE,             // double*
+     VOCTRL_GET_DISPLAY_RES,             // int[2]
+     VOCTRL_GET_WINDOW_ID,               // int64_t*
++    VOCTRL_GET_WAYLAND_DISPLAY,         // void** (struct wl_display*)
++    VOCTRL_GET_WAYLAND_SURFACE,         // void** (struct wl_surface*)
+ 
+     /* private to vo_gpu and vo_gpu_next */
+     VOCTRL_EXTERNAL_RESIZE,
+diff --git a/video/out/wayland_common.c b/video/out/wayland_common.c
+index b5b889b..459016c 100644
+--- a/video/out/wayland_common.c
++++ b/video/out/wayland_common.c
+@@ -4027,6 +4027,12 @@ int vo_wayland_control(struct vo *vo, int *events, int request, void *arg)
+     wl_display_dispatch_pending(wl->display);
+ 
+     switch (request) {
++    case VOCTRL_GET_WAYLAND_DISPLAY:
++        *(void **)arg = wl->display;
++        return VO_TRUE;
++    case VOCTRL_GET_WAYLAND_SURFACE:
++        *(void **)arg = wl->surface;
++        return VO_TRUE;
+     case VOCTRL_CHECK_EVENTS: {
+         wayland_dispatch_events(wl, 1, 0);
+         struct vo_wayland_seat *seat;
