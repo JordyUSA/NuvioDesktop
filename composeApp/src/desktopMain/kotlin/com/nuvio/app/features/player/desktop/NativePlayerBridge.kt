@@ -64,6 +64,13 @@ internal object NativePlayerBridge {
     external fun dispose(handle: Long)
     external fun updateControls(handle: Long, controlsJson: String)
 
+    /** Linux only: whether the next [create] may use Wayland HDR mode (mpv's own window). */
+    external fun setLinuxHdrEnabled(enabled: Boolean)
+
+    /** User preference handed to [setLinuxHdrEnabled] right before each create on Linux. */
+    @Volatile
+    var linuxHdrPreference: Boolean = true
+
     /** macOS only: title, episode line, and poster for the system now-playing widget (Control Center). */
     external fun setNowPlayingMetadata(handle: Long, title: String, subtitle: String, artworkUrl: String)
     external fun requestFocus(handle: Long)

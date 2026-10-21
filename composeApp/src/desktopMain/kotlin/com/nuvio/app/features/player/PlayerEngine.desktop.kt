@@ -137,6 +137,7 @@ private fun NativePlayerSurface(
     val playerSettings by PlayerSettingsRepository.uiState.collectAsState()
     val decoderPriority = playerSettings.decoderPriority
     val nvidiaRtxSuperResolutionEnabled = playerSettings.nvidiaRtxSuperResolutionEnabled
+    val linuxHdrEnabled = playerSettings.linuxHdrEnabled
 
     SideEffect {
         onControllerReady(controller)
@@ -198,6 +199,7 @@ private fun NativePlayerSurface(
         playbackHeaders,
         decoderPriority,
         nvidiaRtxSuperResolutionEnabled,
+        linuxHdrEnabled,
         hostFirstFullSizePaintComplete.value,
         initialPositionMs,
         initialPositionRequestKey,
@@ -213,6 +215,7 @@ private fun NativePlayerSurface(
             initialPositionMs = initialPositionMs,
             decoderPriority = decoderPriority,
             nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled,
+            linuxHdrEnabled = linuxHdrEnabled,
             onError = { message -> latestOnError.value(message) },
         )
         initialPositionRequestKey?.let { key ->

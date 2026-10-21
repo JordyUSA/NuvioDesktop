@@ -92,6 +92,7 @@ import com.nuvio.app.features.streams.StreamAutoPlayMode
 import com.nuvio.app.features.streams.StreamAutoPlaySource
 import com.nuvio.app.isDesktop
 import com.nuvio.app.isIos
+import com.nuvio.app.isLinux
 import com.nuvio.app.isWindows
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.*
@@ -1270,6 +1271,23 @@ private fun PlaybackSettingsSection(
                         checked = autoPlayPlayerSettings.nvidiaRtxSuperResolutionEnabled,
                         isTablet = isTablet,
                         onCheckedChange = PlayerSettingsRepository::setNvidiaRtxSuperResolutionEnabled,
+                    )
+                }
+            }
+        }
+
+        if (isLinux) {
+            SettingsSection(
+                title = stringResource(Res.string.settings_playback_linux_hdr_section),
+                isTablet = isTablet,
+            ) {
+                SettingsGroup(isTablet = isTablet) {
+                    SettingsSwitchRow(
+                        title = stringResource(Res.string.settings_playback_linux_hdr),
+                        description = stringResource(Res.string.settings_playback_linux_hdr_desc),
+                        checked = autoPlayPlayerSettings.linuxHdrEnabled,
+                        isTablet = isTablet,
+                        onCheckedChange = PlayerSettingsRepository::setLinuxHdrEnabled,
                     )
                 }
             }

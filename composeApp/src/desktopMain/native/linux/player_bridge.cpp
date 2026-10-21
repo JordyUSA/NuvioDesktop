@@ -56,6 +56,9 @@ static bool nuvioDebug() {
 namespace {
 
 JavaVM *gVm = nullptr;
+// The "HDR output" playback setting (setLinuxHdrEnabled, sent before each
+// create). NUVIO_LINUX_HDR=0/1 overrides it for testing.
+std::atomic<bool> gLinuxHdrEnabled{false};
 constexpr double kMaxVolumePercent = 200.0;
 
 struct Player {
@@ -2245,6 +2248,10 @@ JNIEXPORT jboolean JNICALL NP(initGtkEarly)(JNIEnv *, jobject) {
     return JNI_TRUE;
 }
 
+JNIEXPORT void JNICALL NP(setLinuxHdrEnabled)(JNIEnv *, jobject, jboolean enabled) {
+    gLinuxHdrEnabled.store(enabled == JNI_TRUE);
+}
+
 JNIEXPORT jlong JNICALL NP(create)(
     JNIEnv *env, jobject /*thiz*/, jlong hostViewPtr, jstring sourceUrl,
     jobjectArray headerLines, jboolean playWhenReady, jlong initialPositionMs,
@@ -2386,14 +2393,15 @@ JNIEXPORT jlong JNICALL NP(create)(
     const char *gpuCtxEnv = getenv("NUVIO_MPV_GPU_CONTEXT");
     const char *hwdecEnv = getenv("NUVIO_MPV_HWDEC");
     bool ctxPinned = gpuCtxEnv && *gpuCtxEnv;
-    // NUVIO_LINUX_HDR=1 on a Wayland session adds a first attempt that gives
-    // mpv its own native Wayland window (see Player::ownWindow) so HDR streams
-    // reach the display as HDR. If Vulkan/Wayland bring-up fails, the embed
-    // attempts below still run, so playback never depends on it.
+    // The HDR output setting (or NUVIO_LINUX_HDR=0/1) on a Wayland session adds
+    // a first attempt that gives mpv its own native Wayland window (see
+    // Player::ownWindow) so HDR streams reach the display as HDR. If Vulkan/
+    // Wayland bring-up fails, the embed attempts below still run, so playback
+    // never depends on it.
     const char *hdrEnv = getenv("NUVIO_LINUX_HDR");
     const char *waylandEnv = getenv("WAYLAND_DISPLAY");
-    bool wantOwnWindow = !ctxPinned && hdrEnv && strcmp(hdrEnv, "1") == 0 &&
-                         waylandEnv && *waylandEnv;
+    bool hdrWanted = (hdrEnv && *hdrEnv) ? strcmp(hdrEnv, "0") != 0 : gLinuxHdrEnabled.load();
+    bool wantOwnWindow = !ctxPinned && hdrWanted && waylandEnv && *waylandEnv;
     struct Attempt { const char *ctx; const char *hwdec; bool ownWindow; };
     std::vector<Attempt> attempts;
     if (wantOwnWindow) {

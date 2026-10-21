@@ -2111,6 +2111,9 @@
     <string name="settings_playback_nvidia_rtx_video_section">NVIDIA RTX Video</string>
     <string name="settings_playback_nvidia_rtx_super_resolution">RTX Video Super Resolution</string>
     <string name="settings_playback_nvidia_rtx_super_resolution_desc">Upscale low-resolution video using NVIDIA RTX AI Super Resolution.</string>
+    <string name="settings_playback_linux_hdr_section">HDR</string>
+    <string name="settings_playback_linux_hdr">HDR output</string>
+    <string name="settings_playback_linux_hdr_desc">Show HDR video in HDR on Wayland desktops with HDR enabled. Video then plays in its own window. Turn off to always use the regular in-app player.</string>
     <!-- Playback settings iOS video output -->
     <string name="settings_playback_ios_video_output">iOS VIDEO OUTPUT</string>
     <string name="settings_playback_ios_hardware_decoder">Hardware decoder</string>

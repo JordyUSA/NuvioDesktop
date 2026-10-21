@@ -53,6 +53,10 @@ internal class NativePlayerController(
     private val host: NativePlayerHost,
     private val nativeCreate: NativePlayerCreate = { hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink ->
         NativePlayerBridge.ensureLoaded()
+        if (DesktopHostOs.current == DesktopHostOs.LINUX) {
+            // Older bridge builds lack the entry point: HDR mode just stays off.
+            runCatching { NativePlayerBridge.setLinuxHdrEnabled(NativePlayerBridge.linuxHdrPreference) }
+        }
         NativePlayerBridge.create(hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink)
     },
     private val nativeDispose: (Long) -> Unit = NativePlayerBridge::dispose,
@@ -130,6 +134,7 @@ internal class NativePlayerController(
         initialPositionMs: Long,
         decoderPriority: Int,
         nvidiaRtxSuperResolutionEnabled: Boolean,
+        linuxHdrEnabled: Boolean = true,
         onError: (String?) -> Unit,
     ) {
         val pending = PendingSource(
@@ -139,6 +144,7 @@ internal class NativePlayerController(
             initialPositionMs = initialPositionMs.coerceAtLeast(0L),
             decoderPriority = decoderPriority,
             nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled,
+            linuxHdrEnabled = linuxHdrEnabled,
             onError = onError,
         )
         var terminalFailure: String? = null
@@ -303,6 +309,7 @@ internal class NativePlayerController(
         // Create off the EDT and come back to it for the parts that touch Swing state.
         val createWorker = Thread({
             try {
+                NativePlayerBridge.linuxHdrPreference = pending.linuxHdrEnabled
                 runCatching {
                     nativeCreate(
                         hostViewPtr,
@@ -976,6 +983,7 @@ internal class NativePlayerController(
             initialPositionMs = pending.initialPositionMs,
             decoderPriority = pending.decoderPriority,
             nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
+            linuxHdrEnabled = pending.linuxHdrEnabled,
             onError = pending.onError,
         )
     }
@@ -1198,6 +1206,7 @@ private data class PendingSource(
     val initialPositionMs: Long,
     val decoderPriority: Int,
     val nvidiaRtxSuperResolutionEnabled: Boolean,
+    val linuxHdrEnabled: Boolean = true,
     val onError: (String?) -> Unit,
 )
 
