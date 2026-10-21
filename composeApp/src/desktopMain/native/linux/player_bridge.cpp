@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cctype>
 #include <clocale>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -134,6 +135,17 @@ struct Player {
     double lastPointerX = -1.0;
     double lastPointerY = -1.0;
     guint pointerButtonMask = 0;  // GDK_BUTTONn_MASK of synthesized presses
+    // HDR output brightness of the controls overlay. mpv blends overlay-add
+    // images as sRGB at libplacebo's fixed 203-nit SDR white, and KWin shows
+    // the PQ swapchain at those absolute levels, so on a dimmed panel the
+    // controls stayed far brighter than the desktop's SDR white. Both values
+    // are parsed from mpv's log (see noteMpvColorLog) on the event thread.
+    std::atomic<bool> hdrOutput{false};     // swapchain is currently PQ
+    std::atomic<float> sdrWhiteNits{203.0f}; // compositor reference luminance
+    // GTK thread only: linear-light dimming table for premultiplied BGRA,
+    // indexed [alpha][channel], rebuilt when the factor changes.
+    std::vector<uint8_t> dimLut;
+    float dimLutFactor = 1.0f;
 };
 
 // ---- Player liveness -----------------------------------------------------
@@ -593,6 +605,52 @@ struct SnapCtx {
     int gen;
 };
 
+double srgbToLinear(double v) {
+    return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4);
+}
+
+double linearToSrgb(double v) {
+    return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+}
+
+// Wayland HDR mode: while mpv outputs PQ, scale the controls snapshot so its
+// white lands on the compositor's SDR white instead of libplacebo's fixed
+// 203 nits (see Player::hdrOutput). Scaling happens in linear light on the
+// un-premultiplied colour, via a table built once per factor.
+void dimSnapshotForHdr(Player *player, cairo_surface_t *surf) {
+    if (!player->ownWindow || !player->hdrOutput.load()) return;
+    float factor = player->sdrWhiteNits.load() / 203.0f;
+    if (factor >= 0.999f || factor <= 0.0f) return;
+    if (player->dimLut.empty() || player->dimLutFactor != factor) {
+        player->dimLut.assign(256 * 256, 0);
+        for (int a = 1; a < 256; ++a) {
+            for (int c = 0; c <= a; ++c) {
+                double lin = srgbToLinear((double)c / a) * factor;
+                double out = linearToSrgb(lin) * a;
+                player->dimLut[a * 256 + c] = (uint8_t)std::min(255.0, out + 0.5);
+            }
+        }
+        player->dimLutFactor = factor;
+    }
+    const uint8_t *lut = player->dimLut.data();
+    unsigned char *data = cairo_image_surface_get_data(surf);
+    int w = cairo_image_surface_get_width(surf);
+    int h = cairo_image_surface_get_height(surf);
+    int stride = cairo_image_surface_get_stride(surf);
+    for (int y = 0; y < h; ++y) {
+        uint32_t *row = reinterpret_cast<uint32_t *>(data + (size_t)y * stride);
+        for (int x = 0; x < w; ++x) {
+            uint32_t px = row[x];
+            uint32_t a = px >> 24;
+            if (!a) continue;  // most of the frame is fully transparent
+            const uint8_t *t = lut + a * 256;
+            row[x] = (a << 24) | ((uint32_t)t[(px >> 16) & 0xff] << 16) |
+                     ((uint32_t)t[(px >> 8) & 0xff] << 8) | t[px & 0xff];
+        }
+    }
+    cairo_surface_mark_dirty(surf);
+}
+
 // Completion of the async controls snapshot: hand the premultiplied BGRA pixels
 // to mpv as an OSD overlay. Runs on the GTK thread like the tick that issued it.
 void onOverlaySnapshot(GObject *src, GAsyncResult *res, gpointer data) {
@@ -642,6 +700,7 @@ void onOverlaySnapshot(GObject *src, GAsyncResult *res, gpointer data) {
         }
     }
     cairo_surface_flush(surf);
+    dimSnapshotForHdr(player, surf);
     char addr[32], sw[16], sh[16], sstride[16];
     snprintf(addr, sizeof addr, "&%zu",
              (size_t)(uintptr_t)cairo_image_surface_get_data(surf));
@@ -1124,6 +1183,35 @@ void queueMousePos(Player *player, mpv_node *node) {
     // motion updates mpv produced meanwhile.
     if (!player->motionPending.exchange(true)) {
         g_main_context_invoke(nullptr, syncPointerOnGtk, player);
+    }
+}
+
+// Track what the HDR overlay dimming needs from mpv's verbose log, since
+// neither is exposed as a property: the compositor's reference (SDR white)
+// luminance from its preferred image description, and whether libplacebo
+// picked a PQ swapchain. Event thread.
+void noteMpvColorLog(Player *player, const mpv_event_log_message *msg) {
+    if (!msg || !msg->prefix || !msg->text) return;
+    if (strcmp(msg->prefix, "vo/gpu-next/wayland") == 0) {
+        // "transfer: min_luma=%f, max_luma=%f, ref_luma=%f". KWin also sends
+        // a plain SDR description (max == ref, no headroom); only the one
+        // with HDR headroom describes where SDR white sits under PQ output.
+        const char *maxP = strstr(msg->text, "max_luma=");
+        const char *refP = strstr(msg->text, "ref_luma=");
+        float maxLuma = 0, refLuma = 0;
+        if (maxP && refP && sscanf(maxP, "max_luma=%f", &maxLuma) == 1 &&
+            sscanf(refP, "ref_luma=%f", &refLuma) == 1 && refLuma > 0 &&
+            maxLuma > refLuma * 1.01f) {
+            if (player->sdrWhiteNits.exchange(refLuma) != refLuma) {
+                NUVIO_LOG("HDR overlay: compositor SDR white %.0f nits", refLuma);
+            }
+        }
+    } else if (strcmp(msg->prefix, "vo/gpu-next/libplacebo") == 0 &&
+               strstr(msg->text, "Picked surface configuration")) {
+        bool pq = strstr(msg->text, "HDR10_ST2084") != nullptr;
+        if (player->hdrOutput.exchange(pq) != pq) {
+            NUVIO_LOG("HDR overlay: output is %s", pq ? "PQ (dimming controls)" : "SDR");
+        }
     }
 }
 
@@ -1903,6 +1991,7 @@ void runEventLoop(Player *player) {
             case MPV_EVENT_LOG_MESSAGE: {
                 auto *msg = static_cast<mpv_event_log_message *>(event->data);
                 if (msg) NUVIO_LOG("mpv[%s] %s: %s", msg->level, msg->prefix, msg->text);
+                if (player->ownWindow) noteMpvColorLog(player, msg);
                 break;
             }
             case MPV_EVENT_END_FILE: {
@@ -2022,8 +2111,10 @@ JNIEXPORT jlong JNICALL NP(create)(
     }
 
     auto configure = [&](mpv_handle *m, const char *gpuCtx, const char *hwdec, bool ownWindow) {
-        // Surface mpv's own diagnostics (drained by the event thread).
-        mpv_request_log_messages(m, nuvioDebug() ? "v" : "no");
+        // Surface mpv's own diagnostics (drained by the event thread). Own-window
+        // mode always needs the verbose colour lines (noteMpvColorLog); they are
+        // only printed with NUVIO_BRIDGE_DEBUG.
+        mpv_request_log_messages(m, (nuvioDebug() || ownWindow) ? "v" : "no");
         // Embed into the host AWT Canvas's X11 window (Wayland HDR mode opens
         // mpv's own window instead — see Player::ownWindow).
         if (!wid.empty() && !ownWindow) mpv_set_option_string(m, "wid", wid.c_str());
