@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <clocale>
 #include <condition_variable>
 #include <cstdint>
@@ -116,6 +117,23 @@ struct Player {
     // attached — WKWebView/WebView2 parity — so the page's own keydown
     // shortcuts work instead of a Kotlin-side reimplementation.
     Window savedFocusXid = 0;
+    // Wayland HDR mode (NUVIO_LINUX_HDR=1, see create): mpv renders into its own
+    // native Wayland window with vo=gpu-next so the compositor receives the
+    // stream's HDR colorspace — XWayland, which the "wid" embed needs, has no
+    // HDR path. The controls page keeps rendering offscreen and compositing via
+    // overlay-add exactly as in embed mode, but pointer/keyboard input now lands
+    // on mpv's window, so mpv forwards it (mouse-pos + a script-binding input
+    // section) and we synthesize the matching GDK events into the webview.
+    bool ownWindow = false;
+    std::atomic<int64_t> mouseX{0};  // mpv window (OSD) pixels
+    std::atomic<int64_t> mouseY{0};
+    std::atomic<bool> mouseHover{false};
+    std::atomic<bool> motionPending{false};  // a pointer sync is queued on GTK
+    // GTK thread only:
+    bool pointerInside = false;
+    double lastPointerX = -1.0;
+    double lastPointerY = -1.0;
+    guint pointerButtonMask = 0;  // GDK_BUTTONn_MASK of synthesized presses
 };
 
 // ---- Player liveness -----------------------------------------------------
@@ -363,9 +381,25 @@ void onControlsEval(GObject *src, GAsyncResult *res, gpointer data) {
 // GTK thread only.
 void flushControlsJson(Player *player) {
     if (!player->webview || player->pendingControlsJson.empty()) return;
+    std::string json = player->pendingControlsJson;
+    if (player->ownWindow && player->mpv) {
+        // Kotlin reports the AWT window's fullscreen state, but in Wayland HDR
+        // mode the video lives in mpv's own window: report that one instead so
+        // the page's Escape / fullscreen-button logic acts on the right window.
+        const char *needle = "\"isFullscreen\":";
+        size_t k = json.find(needle);
+        if (k != std::string::npos) {
+            size_t v = k + strlen(needle);
+            size_t len = json.compare(v, 4, "true") == 0 ? 4
+                       : json.compare(v, 5, "false") == 0 ? 5 : 0;
+            if (len) {
+                json.replace(v, len, mpvGetFlag(player->mpv, "fullscreen") ? "true" : "false");
+            }
+        }
+    }
     std::string script =
         "(function(){if(!window.playerControls)return 'missing';"
-        "window.playerControls(JSON.parse(" + jsLiteral(player->pendingControlsJson) + "));"
+        "window.playerControls(JSON.parse(" + jsLiteral(json) + "));"
         "return 'ok';})()";
     webkit_web_view_evaluate_javascript(player->webview, script.c_str(), -1, nullptr,
                                         nullptr, nullptr, onControlsEval, player);
@@ -379,6 +413,13 @@ void flushControlsJson(Player *player) {
 // autohide is explicitly disabled. Swap the overlay cursor in lockstep with
 // chrome visibility instead. GTK thread only.
 void setOverlayCursorHidden(Player *player, bool hidden) {
+    if (player->ownWindow) {
+        // The pointer is over mpv's window, not the overlay: let mpv hide it.
+        if (player->cursorIsHidden == hidden || !player->mpv) return;
+        mpv_set_property_string(player->mpv, "cursor-autohide", hidden ? "always" : "no");
+        player->cursorIsHidden = hidden;
+        return;
+    }
     if (player->cursorIsHidden == hidden || !player->gtkWindow) return;
     GdkCursor *cur = hidden ? player->cursorHidden : player->cursorVisible;
     if (!cur) return;
@@ -405,6 +446,23 @@ void focusOverlay(Player *player) {
     if (!player->gtkWindow || !player->overlayXid) return;
     GdkWindow *gw = gtk_widget_get_window(player->gtkWindow);
     if (!gw) return;
+    if (player->ownWindow) {
+        // Keyboard input arrives from mpv's window and is synthesized into the
+        // webview (see dispatchMpvInput), so real X focus would only steal the
+        // keyboard from whatever the user is using. Mark the overlay toplevel
+        // focused GTK-side instead, so the page treats itself as focused.
+        if (player->webview) gtk_widget_grab_focus(GTK_WIDGET(player->webview));
+        GdkEvent *ev = gdk_event_new(GDK_FOCUS_CHANGE);
+        ev->focus_change.window = GDK_WINDOW(g_object_ref(gw));
+        ev->focus_change.send_event = TRUE;
+        ev->focus_change.in = TRUE;
+        GdkSeat *seat = gdk_display_get_default_seat(gdk_window_get_display(gw));
+        GdkDevice *kbd = seat ? gdk_seat_get_keyboard(seat) : nullptr;
+        if (kbd) gdk_event_set_device(ev, kbd);
+        gtk_main_do_event(ev);
+        gdk_event_free(ev);
+        return;
+    }
     Display *dpy = GDK_WINDOW_XDISPLAY(gw);
     // Remember the previous focus owner (normally the AWT toplevel) so
     // teardown can hand the keyboard back. Only on the first grab: re-grabs
@@ -482,6 +540,16 @@ void onPlayerMessage(WebKitUserContentManager *, WebKitJavascriptResult *js, gpo
         // The page just defined its API surface — deliver any controls payload
         // that arrived before the page finished loading (macOS/Windows parity).
         if (strcmp(type, "controlsReady") == 0) flushControlsJson(player);
+        // Wayland HDR mode: fullscreen belongs to mpv's window, not the AWT one.
+        // The fullscreen property observer re-flushes the page state.
+        if (player->ownWindow && strcmp(type, "toggleFullscreen") == 0) {
+            const char *cmd[] = {"cycle", "fullscreen", nullptr};
+            mpv_command(player->mpv, cmd);
+            g_free(type);
+            if (typeV) g_object_unref(typeV);
+            if (valV) g_object_unref(valV);
+            return;
+        }
     }
     JNIEnv *env = attachGtkThread();
     if (env && type) {
@@ -621,12 +689,23 @@ void compositeOverlay(Player *player) {
     // overlay at its old, smaller size, and mouse motion in the uncovered region
     // goes to mpv's window instead: the page never sees it and moving the mouse
     // "sometimes" fails to reveal the controls.
-    XWindowAttributes hostWa;
-    if (XGetWindowAttributes(dpy, player->hostXid, &hostWa) && hostWa.width > 0 &&
-        hostWa.height > 0) {
+    // In Wayland HDR mode the video is in mpv's own window, so the overlay
+    // follows mpv's OSD size (its window in device pixels) instead.
+    int targetW = 0, targetH = 0;
+    if (player->ownWindow) {
+        targetW = (int)mpvGetInt(player->mpv, "osd-width");
+        targetH = (int)mpvGetInt(player->mpv, "osd-height");
+    } else {
+        XWindowAttributes hostWa;
+        if (XGetWindowAttributes(dpy, player->hostXid, &hostWa)) {
+            targetW = hostWa.width;
+            targetH = hostWa.height;
+        }
+    }
+    if (targetW > 0 && targetH > 0) {
         XWindowAttributes ovWa0;
         if (XGetWindowAttributes(dpy, player->overlayXid, &ovWa0) &&
-            (ovWa0.width != hostWa.width || ovWa0.height != hostWa.height)) {
+            (ovWa0.width != targetW || ovWa0.height != targetH)) {
             // gtk_window_resize alone never lands here: GTK applies it in the
             // frame-clock layout phase, and the redirected overlay's clock is
             // stalled (the same stall the forcing below works around) — on
@@ -636,7 +715,7 @@ void compositeOverlay(Player *player) {
             // No early return: a transiently mis-sized snapshot beats a frozen
             // overlay, and returning here would skip the clock forcing.
             // GDK sizes are logical: it multiplies by the window's scale factor
-            // when it talks to X, while hostWa/ovWa0 above are X device pixels.
+            // when it talks to X, while targetW/H and ovWa0 above are X device pixels.
             // Passing device pixels here made the overlay scale-times too large
             // on a HiDPI output (3072x1782 host -> 6144x3564 overlay at scale 2),
             // so the mismatch could never settle: every tick resized, took the
@@ -644,8 +723,8 @@ void compositeOverlay(Player *player) {
             // add/remove cycle that reads on screen as flicker.
             int ovScale = gdk_window_get_scale_factor(gw);
             if (ovScale < 1) ovScale = 1;
-            const int logicalW = hostWa.width / ovScale;
-            const int logicalH = hostWa.height / ovScale;
+            const int logicalW = targetW / ovScale;
+            const int logicalH = targetH / ovScale;
             gdk_window_resize(gw, logicalW, logicalH);
             gtk_window_resize(GTK_WINDOW(player->gtkWindow), logicalW, logicalH);
             // The X window now resizes, but the WebKit view renders at the GTK
@@ -734,6 +813,350 @@ gboolean compositeTick(gpointer data) {
     if (player->mpv && player->gtkWindow) compositeOverlay(player);
     return G_SOURCE_CONTINUE;
 }
+
+// ---- Wayland HDR mode: input forwarding ----------------------------------
+// mpv's own window receives the pointer and keyboard. mpv reports the pointer
+// through the mouse-pos property and buttons/keys through the script-binding
+// section installed in create (delivered as "key-binding" client messages).
+// Both are replayed into the controls webview as synthesized GDK events, so
+// the shared page sees ordinary trusted DOM input (pointermove/click/keydown
+// with real event.code) exactly as in embed mode. All GTK thread.
+
+void emitPlayerEvent(Player *player, const char *type, double value) {
+    if (!player->eventSink || !player->eventMethod) return;
+    JNIEnv *env = attachGtkThread();
+    if (!env) return;
+    jstring jtype = env->NewStringUTF(type);
+    env->CallVoidMethod(player->eventSink, player->eventMethod, jtype, (jdouble)value);
+    env->DeleteLocalRef(jtype);
+}
+
+guint32 synthEventTime() {
+    // Real timestamps: WebKit's click counter compares event times against the
+    // double-click interval, so a constant time would make every click a double.
+    return (guint32)(g_get_monotonic_time() / 1000);
+}
+
+GdkEvent *newSynthEvent(GdkEventType type, GdkWindow *window, bool keyboard) {
+    GdkEvent *ev = gdk_event_new(type);
+    ev->any.window = GDK_WINDOW(g_object_ref(window));
+    ev->any.send_event = TRUE;
+    GdkSeat *seat = gdk_display_get_default_seat(gdk_window_get_display(window));
+    GdkDevice *dev = seat ? (keyboard ? gdk_seat_get_keyboard(seat) : gdk_seat_get_pointer(seat))
+                          : nullptr;
+    if (dev) {
+        gdk_event_set_device(ev, dev);
+        gdk_event_set_source_device(ev, dev);
+    }
+    return ev;
+}
+
+void deliverSynthEvent(GdkEvent *ev) {
+    gtk_main_do_event(ev);
+    gdk_event_free(ev);
+}
+
+// mpv window pixels -> webview (GDK logical) coordinates. The overlay is sized
+// to mpv's OSD (compositeOverlay), so this is normally just the GDK scale.
+bool mapPointer(Player *p, double &x, double &y) {
+    if (!p->webview || !p->mpv) return false;
+    int64_t osdW = mpvGetInt(p->mpv, "osd-width");
+    int64_t osdH = mpvGetInt(p->mpv, "osd-height");
+    GtkAllocation a;
+    gtk_widget_get_allocation(GTK_WIDGET(p->webview), &a);
+    if (osdW <= 0 || osdH <= 0 || a.width <= 0 || a.height <= 0) return false;
+    x = (double)p->mouseX.load() * a.width / (double)osdW;
+    y = (double)p->mouseY.load() * a.height / (double)osdH;
+    return true;
+}
+
+void fillPointerCoords(GdkWindow *w, double x, double y, gdouble *outX, gdouble *outY,
+                       gdouble *rootX, gdouble *rootY) {
+    gint ox = 0, oy = 0;
+    gdk_window_get_origin(w, &ox, &oy);
+    *outX = x;
+    *outY = y;
+    *rootX = ox + x;
+    *rootY = oy + y;
+}
+
+// Bring the webview's pointer in line with mpv's: crossing events on
+// enter/leave, motion otherwise. Called for every pointer change and before
+// every button/scroll so presses land where the pointer actually is.
+void syncPointer(Player *p, guint modifiers) {
+    GdkWindow *w = p->webview ? gtk_widget_get_window(GTK_WIDGET(p->webview)) : nullptr;
+    if (!w) return;
+    double x = 0, y = 0;
+    if (!mapPointer(p, x, y)) return;
+    bool hover = p->mouseHover.load();
+    if (!hover) {
+        if (p->pointerInside) {
+            GdkEvent *ev = newSynthEvent(GDK_LEAVE_NOTIFY, w, false);
+            ev->crossing.time = synthEventTime();
+            fillPointerCoords(w, x, y, &ev->crossing.x, &ev->crossing.y,
+                              &ev->crossing.x_root, &ev->crossing.y_root);
+            ev->crossing.mode = GDK_CROSSING_NORMAL;
+            ev->crossing.detail = GDK_NOTIFY_ANCESTOR;
+            deliverSynthEvent(ev);
+            p->pointerInside = false;
+        }
+        return;
+    }
+    if (!p->pointerInside) {
+        GdkEvent *ev = newSynthEvent(GDK_ENTER_NOTIFY, w, false);
+        ev->crossing.time = synthEventTime();
+        fillPointerCoords(w, x, y, &ev->crossing.x, &ev->crossing.y,
+                          &ev->crossing.x_root, &ev->crossing.y_root);
+        ev->crossing.mode = GDK_CROSSING_NORMAL;
+        ev->crossing.detail = GDK_NOTIFY_ANCESTOR;
+        deliverSynthEvent(ev);
+        p->pointerInside = true;
+        p->lastPointerX = p->lastPointerY = -1.0;
+    }
+    if (x == p->lastPointerX && y == p->lastPointerY) return;
+    p->lastPointerX = x;
+    p->lastPointerY = y;
+    GdkEvent *ev = newSynthEvent(GDK_MOTION_NOTIFY, w, false);
+    ev->motion.time = synthEventTime();
+    fillPointerCoords(w, x, y, &ev->motion.x, &ev->motion.y, &ev->motion.x_root,
+                      &ev->motion.y_root);
+    ev->motion.state = (GdkModifierType)(p->pointerButtonMask | modifiers);
+    ev->motion.is_hint = FALSE;
+    deliverSynthEvent(ev);
+}
+
+gboolean syncPointerOnGtk(gpointer data) {
+    auto *p = static_cast<Player *>(data);
+    if (!playerAlive(p)) return G_SOURCE_REMOVE;
+    p->motionPending.store(false);
+    syncPointer(p, 0);
+    return G_SOURCE_REMOVE;
+}
+
+void sendButton(Player *p, guint button, bool press, guint modifiers) {
+    GdkWindow *w = p->webview ? gtk_widget_get_window(GTK_WIDGET(p->webview)) : nullptr;
+    if (!w) return;
+    syncPointer(p, modifiers);
+    double x = 0, y = 0;
+    if (!mapPointer(p, x, y)) return;
+    GdkEvent *ev = newSynthEvent(press ? GDK_BUTTON_PRESS : GDK_BUTTON_RELEASE, w, false);
+    ev->button.time = synthEventTime();
+    fillPointerCoords(w, x, y, &ev->button.x, &ev->button.y, &ev->button.x_root,
+                      &ev->button.y_root);
+    ev->button.button = button;
+    ev->button.state = (GdkModifierType)(p->pointerButtonMask | modifiers);
+    deliverSynthEvent(ev);
+    guint mask = button >= 1 && button <= 5 ? (GDK_BUTTON1_MASK << (button - 1)) : 0;
+    if (press) p->pointerButtonMask |= mask;
+    else p->pointerButtonMask &= ~mask;
+}
+
+void sendScroll(Player *p, GdkScrollDirection dir, guint modifiers) {
+    GdkWindow *w = p->webview ? gtk_widget_get_window(GTK_WIDGET(p->webview)) : nullptr;
+    if (!w) return;
+    syncPointer(p, modifiers);
+    double x = 0, y = 0;
+    if (!mapPointer(p, x, y)) return;
+    GdkEvent *ev = newSynthEvent(GDK_SCROLL, w, false);
+    ev->scroll.time = synthEventTime();
+    fillPointerCoords(w, x, y, &ev->scroll.x, &ev->scroll.y, &ev->scroll.x_root,
+                      &ev->scroll.y_root);
+    ev->scroll.direction = dir;
+    ev->scroll.state = (GdkModifierType)modifiers;
+    deliverSynthEvent(ev);
+}
+
+// mpv key name (modifiers already stripped) + its text -> GDK keyval.
+guint mpvKeyToKeyval(const std::string &name, const std::string &text) {
+    static const struct { const char *mpv; guint keyval; } kNamed[] = {
+        {"SPACE", GDK_KEY_space},     {"ENTER", GDK_KEY_Return},
+        {"KP_ENTER", GDK_KEY_KP_Enter}, {"ESC", GDK_KEY_Escape},
+        {"BS", GDK_KEY_BackSpace},    {"TAB", GDK_KEY_Tab},
+        {"DEL", GDK_KEY_Delete},      {"INS", GDK_KEY_Insert},
+        {"HOME", GDK_KEY_Home},       {"END", GDK_KEY_End},
+        {"PGUP", GDK_KEY_Page_Up},    {"PGDWN", GDK_KEY_Page_Down},
+        {"LEFT", GDK_KEY_Left},       {"RIGHT", GDK_KEY_Right},
+        {"UP", GDK_KEY_Up},           {"DOWN", GDK_KEY_Down},
+        {"SHARP", GDK_KEY_numbersign},
+    };
+    for (const auto &k : kNamed) {
+        if (name == k.mpv) return k.keyval;
+    }
+    if (name.size() >= 2 && name[0] == 'F' && isdigit((unsigned char)name[1])) {
+        int n = atoi(name.c_str() + 1);
+        if (n >= 1 && n <= 12) return GDK_KEY_F1 + (n - 1);
+    }
+    // Printable keys: mpv names them by their character (ANY_UNICODE binding).
+    const std::string &chars = !text.empty() ? text : name;
+    if (!chars.empty() && g_utf8_validate(chars.c_str(), -1, nullptr) &&
+        g_utf8_strlen(chars.c_str(), -1) == 1) {
+        return gdk_unicode_to_keyval(g_utf8_get_char(chars.c_str()));
+    }
+    return GDK_KEY_VoidSymbol;
+}
+
+void sendKey(Player *p, guint keyval, bool press, guint modifiers) {
+    GdkWindow *w = p->webview ? gtk_widget_get_window(GTK_WIDGET(p->webview)) : nullptr;
+    if (!w || keyval == GDK_KEY_VoidSymbol) return;
+    GdkEvent *ev = newSynthEvent(press ? GDK_KEY_PRESS : GDK_KEY_RELEASE, w, true);
+    ev->key.time = synthEventTime();
+    // A real hardware keycode is what WebKit derives event.code from (the page
+    // matches on "Space", "KeyF", "ArrowLeft", ...), so look one up.
+    GdkKeymap *keymap = gdk_keymap_get_for_display(gdk_window_get_display(w));
+    GdkKeymapKey *keys = nullptr;
+    gint nKeys = 0;
+    if (gdk_keymap_get_entries_for_keyval(keymap, keyval, &keys, &nKeys) && nKeys > 0) {
+        ev->key.hardware_keycode = (guint16)keys[0].keycode;
+        ev->key.group = (guint8)keys[0].group;
+        if (keys[0].level == 1) modifiers |= GDK_SHIFT_MASK;
+    }
+    g_free(keys);
+    ev->key.keyval = keyval;
+    ev->key.state = (GdkModifierType)modifiers;
+    gunichar uc = gdk_keyval_to_unicode(keyval);
+    char buf[8] = {0};
+    if (uc) g_unichar_to_utf8(uc, buf);
+    ev->key.string = g_strdup(buf);
+    ev->key.length = (gint)strlen(buf);
+    deliverSynthEvent(ev);
+}
+
+struct MpvInput {
+    Player *player;
+    std::string state;  // "d-" down, "u-" up, "r-" repeat, "p-" press (no up follows)
+    std::string key;    // mpv key name, possibly with Shift+/Ctrl+/Alt+/Meta+ prefixes
+    std::string text;
+};
+
+gboolean dispatchMpvInputOnGtk(gpointer data) {
+    auto *in = static_cast<MpvInput *>(data);
+    Player *p = in->player;
+    if (!playerAlive(p) || !p->webview) {
+        delete in;
+        return G_SOURCE_REMOVE;
+    }
+    char phase = in->state.empty() ? 'p' : in->state[0];
+    bool down = phase == 'd' || phase == 'p' || phase == 'r';
+    bool up = phase == 'u' || phase == 'p';
+    std::string key = in->key;
+    guint mods = 0;
+    static const struct { const char *prefix; guint mask; } kMods[] = {
+        {"Shift+", GDK_SHIFT_MASK}, {"Ctrl+", GDK_CONTROL_MASK},
+        {"Alt+", GDK_MOD1_MASK},    {"Meta+", GDK_META_MASK | GDK_SUPER_MASK},
+    };
+    for (bool stripped = true; stripped;) {
+        stripped = false;
+        for (const auto &m : kMods) {
+            size_t n = strlen(m.prefix);
+            if (key.size() > n && key.compare(0, n, m.prefix) == 0) {
+                mods |= m.mask;
+                key.erase(0, n);
+                stripped = true;
+            }
+        }
+    }
+
+    static const struct { const char *mpv; guint button; } kButtons[] = {
+        {"MBTN_LEFT", 1}, {"MBTN_MID", 2}, {"MBTN_RIGHT", 3},
+        {"MBTN_BACK", 8}, {"MBTN_FORWARD", 9},
+    };
+    static const struct { const char *mpv; GdkScrollDirection dir; } kWheels[] = {
+        {"WHEEL_UP", GDK_SCROLL_UP},     {"WHEEL_DOWN", GDK_SCROLL_DOWN},
+        {"WHEEL_LEFT", GDK_SCROLL_LEFT}, {"WHEEL_RIGHT", GDK_SCROLL_RIGHT},
+    };
+    bool handled = false;
+    if (key == "CLOSE_WIN") {
+        // Closing mpv's window means leaving the player, like the back button.
+        if (phase != 'u') emitPlayerEvent(p, "back", 0);
+        handled = true;
+    }
+    for (const auto &b : kButtons) {
+        if (handled || key != b.mpv) continue;
+        // Repeats make no sense for a button; a 'p' (press with no separate up)
+        // becomes a full click.
+        if (phase == 'd' || phase == 'p') sendButton(p, b.button, true, mods);
+        if (up) sendButton(p, b.button, false, mods);
+        handled = true;
+    }
+    for (const auto &w : kWheels) {
+        if (handled || key != w.mpv) continue;
+        if (phase != 'u') sendScroll(p, w.dir, mods);
+        handled = true;
+    }
+    if (!handled) {
+        guint keyval = mpvKeyToKeyval(key, in->text);
+        if (down) sendKey(p, keyval, true, mods);
+        if (up) sendKey(p, keyval, false, mods);
+    }
+    delete in;
+    return G_SOURCE_REMOVE;
+}
+
+gboolean flushControlsOnGtk(gpointer data) {
+    auto *p = static_cast<Player *>(data);
+    if (playerAlive(p)) flushControlsJson(p);
+    return G_SOURCE_REMOVE;
+}
+
+// Event thread -> GTK thread hand-off for mpv's input notifications.
+void queueMpvInput(Player *player, mpv_event_client_message *msg) {
+    if (!gGtkReady.load() || !msg || msg->num_args < 4) return;
+    if (strcmp(msg->args[0], "key-binding") != 0 || strcmp(msg->args[1], "nuvio-input") != 0) {
+        return;
+    }
+    auto *in = new MpvInput{player, msg->args[2] ? msg->args[2] : "",
+                            msg->args[3] ? msg->args[3] : "",
+                            (msg->num_args > 4 && msg->args[4]) ? msg->args[4] : ""};
+    g_main_context_invoke(nullptr, dispatchMpvInputOnGtk, in);
+}
+
+void queueMousePos(Player *player, mpv_node *node) {
+    if (!gGtkReady.load() || !node || node->format != MPV_FORMAT_NODE_MAP) return;
+    mpv_node_list *list = node->u.list;
+    for (int i = 0; i < list->num; ++i) {
+        const char *k = list->keys[i];
+        mpv_node &v = list->values[i];
+        if (strcmp(k, "x") == 0 && v.format == MPV_FORMAT_INT64) player->mouseX.store(v.u.int64);
+        else if (strcmp(k, "y") == 0 && v.format == MPV_FORMAT_INT64) player->mouseY.store(v.u.int64);
+        else if (strcmp(k, "hover") == 0 && v.format == MPV_FORMAT_FLAG) player->mouseHover.store(v.u.flag != 0);
+    }
+    // Coalesce: one queued sync reads the latest position, however many
+    // motion updates mpv produced meanwhile.
+    if (!player->motionPending.exchange(true)) {
+        g_main_context_invoke(nullptr, syncPointerOnGtk, player);
+    }
+}
+
+// Install the input section that routes mpv-window input to us. Every binding
+// targets the same script-binding; the key name in the message tells them apart.
+void installOwnWindowInput(mpv_handle *mpv) {
+    std::string target = std::string(" script-binding ") + mpv_client_name(mpv) + "/nuvio-input\n";
+    static const char *kKeys[] = {
+        "MBTN_LEFT", "MBTN_MID", "MBTN_RIGHT", "MBTN_BACK", "MBTN_FORWARD",
+        "WHEEL_UP", "WHEEL_DOWN", "WHEEL_LEFT", "WHEEL_RIGHT",
+        "SPACE", "ENTER", "KP_ENTER", "ESC", "BS", "TAB", "DEL", "INS", "HOME", "END",
+        "PGUP", "PGDWN", "LEFT", "RIGHT", "UP", "DOWN", "SHARP",
+        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    };
+    // The page reads Shift on wheel (fine seek) and on some shortcuts; mpv only
+    // matches a binding with the exact modifier set, so bind both variants.
+    static const char *kMods[] = {"", "Shift+", "Ctrl+", "Alt+"};
+    std::string section;
+    for (const char *mod : kMods) {
+        for (const char *key : kKeys) section += std::string(mod) + key + target;
+    }
+    // Every other printable key (letters, digits, punctuation), with its text.
+    section += "ANY_UNICODE" + target;
+    section += "CLOSE_WIN" + target;
+    const char *define[] = {"define-section", "nuvio-input", section.c_str(), "force", nullptr};
+    int r = mpv_command(mpv, define);
+    const char *enable[] = {"enable-section", "nuvio-input", "exclusive", nullptr};
+    if (r >= 0) r = mpv_command(mpv, enable);
+    if (r < 0) NUVIO_ERR("installing mpv input section failed: %s", mpv_error_string(r));
+}
+
+constexpr uint64_t kObserveMousePos = 1;
+constexpr uint64_t kObserveFullscreen = 2;
 
 // JSON-escape a UTF-8 string for embedding in the track JSON we hand the
 // controls webview / Kotlin decoder.
@@ -1499,6 +1922,23 @@ void runEventLoop(Player *player) {
             case MPV_EVENT_SHUTDOWN:
                 player->running.store(false);
                 break;
+            case MPV_EVENT_CLIENT_MESSAGE:
+                if (player->ownWindow) {
+                    queueMpvInput(player, static_cast<mpv_event_client_message *>(event->data));
+                }
+                break;
+            case MPV_EVENT_PROPERTY_CHANGE: {
+                auto *prop = static_cast<mpv_event_property *>(event->data);
+                if (!prop || !player->ownWindow) break;
+                if (event->reply_userdata == kObserveMousePos && prop->format == MPV_FORMAT_NODE) {
+                    queueMousePos(player, static_cast<mpv_node *>(prop->data));
+                } else if (event->reply_userdata == kObserveFullscreen && gGtkReady.load()) {
+                    // Fullscreen also changes from the compositor (keyboard
+                    // shortcut, window menu): keep the page's isFullscreen true.
+                    g_main_context_invoke(nullptr, flushControlsOnGtk, player);
+                }
+                break;
+            }
             default:
                 break;
         }
@@ -1581,23 +2021,38 @@ JNIEXPORT jlong JNICALL NP(create)(
         if (!headers.empty()) headerFields = joinHeaderFields(headers);
     }
 
-    auto configure = [&](mpv_handle *m, const char *gpuCtx, const char *hwdec) {
+    auto configure = [&](mpv_handle *m, const char *gpuCtx, const char *hwdec, bool ownWindow) {
         // Surface mpv's own diagnostics (drained by the event thread).
         mpv_request_log_messages(m, nuvioDebug() ? "v" : "no");
-        // Embed into the host AWT Canvas's X11 window.
-        if (!wid.empty()) mpv_set_option_string(m, "wid", wid.c_str());
+        // Embed into the host AWT Canvas's X11 window (Wayland HDR mode opens
+        // mpv's own window instead — see Player::ownWindow).
+        if (!wid.empty() && !ownWindow) mpv_set_option_string(m, "wid", wid.c_str());
 
         // Nuvio renders its own controls; keep mpv silent and non-interactive.
         mpv_set_option_string(m, "osc", "no");
         mpv_set_option_string(m, "osd-level", "0");
         mpv_set_option_string(m, "input-default-bindings", "no");
-        mpv_set_option_string(m, "input-vo-keyboard", "no");
-        mpv_set_option_string(m, "input-cursor", "no");
+        // Own-window mode needs mpv's window input: it is forwarded to the
+        // controls page (installOwnWindowInput / mouse-pos).
+        mpv_set_option_string(m, "input-vo-keyboard", ownWindow ? "yes" : "no");
+        mpv_set_option_string(m, "input-cursor", ownWindow ? "yes" : "no");
         mpv_set_option_string(m, "cursor-autohide", "no");
         mpv_set_option_string(m, "keep-open", "yes");
         mpv_set_option_string(m, "volume-max", "200");
         mpv_set_option_string(m, "idle", "yes");
-        mpv_set_option_string(m, "vo", "gpu");
+        mpv_set_option_string(m, "vo", ownWindow ? "gpu-next" : "gpu");
+        if (ownWindow) {
+            // Native Wayland + Vulkan + gpu-next is the path on which mpv hands
+            // the compositor the stream's colorspace (wp_color_management_v1),
+            // which is what makes the output actually HDR. Without compositor
+            // support mpv simply tone-maps to SDR.
+            mpv_set_option_string(m, "gpu-api", "vulkan");
+            mpv_set_option_string(m, "fullscreen", "yes");
+            mpv_set_option_string(m, "title", "Nuvio");
+            mpv_set_option_string(m, "wayland-app-id", "com.nuvio.media.desktop");
+            // Clicks belong to the controls page, not to window moves.
+            mpv_set_option_string(m, "window-dragging", "no");
+        }
         // Bring the VO/OSD up immediately (before the first decoded frame) so the
         // controls overlay — including the loading screen — can render via
         // overlay-add while a slow/non-faststart file is still opening, instead of
@@ -1660,12 +2115,25 @@ JNIEXPORT jlong JNICALL NP(create)(
     const char *gpuCtxEnv = getenv("NUVIO_MPV_GPU_CONTEXT");
     const char *hwdecEnv = getenv("NUVIO_MPV_HWDEC");
     bool ctxPinned = gpuCtxEnv && *gpuCtxEnv;
-    struct Attempt { const char *ctx; const char *hwdec; };
-    Attempt attempts[2] = {
-        {ctxPinned ? gpuCtxEnv : "x11egl", (hwdecEnv && *hwdecEnv) ? hwdecEnv : "auto"},
-        {"x11vk", (hwdecEnv && *hwdecEnv) ? hwdecEnv : "nvdec-copy"},
-    };
-    int nAttempts = ctxPinned ? 1 : 2;
+    // NUVIO_LINUX_HDR=1 on a Wayland session adds a first attempt that gives
+    // mpv its own native Wayland window (see Player::ownWindow) so HDR streams
+    // reach the display as HDR. If Vulkan/Wayland bring-up fails, the embed
+    // attempts below still run, so playback never depends on it.
+    const char *hdrEnv = getenv("NUVIO_LINUX_HDR");
+    const char *waylandEnv = getenv("WAYLAND_DISPLAY");
+    bool wantOwnWindow = !ctxPinned && hdrEnv && strcmp(hdrEnv, "1") == 0 &&
+                         waylandEnv && *waylandEnv;
+    struct Attempt { const char *ctx; const char *hwdec; bool ownWindow; };
+    std::vector<Attempt> attempts;
+    if (wantOwnWindow) {
+        attempts.push_back({"waylandvk", (hwdecEnv && *hwdecEnv) ? hwdecEnv : "auto", true});
+    }
+    attempts.push_back({ctxPinned ? gpuCtxEnv : "x11egl",
+                        (hwdecEnv && *hwdecEnv) ? hwdecEnv : "auto", false});
+    if (!ctxPinned) {
+        attempts.push_back({"x11vk", (hwdecEnv && *hwdecEnv) ? hwdecEnv : "nvdec-copy", false});
+    }
+    int nAttempts = (int)attempts.size();
     int initResult = MPV_ERROR_GENERIC;
     for (int a = 0; a < nAttempts; ++a) {
         if (!player->mpv) player->mpv = mpv_create();
@@ -1673,9 +2141,10 @@ JNIEXPORT jlong JNICALL NP(create)(
             NUVIO_ERR("mpv_create() returned NULL on retry");
             break;
         }
-        configure(player->mpv, attempts[a].ctx, attempts[a].hwdec);
+        configure(player->mpv, attempts[a].ctx, attempts[a].hwdec, attempts[a].ownWindow);
         initResult = mpv_initialize(player->mpv);
         if (initResult >= 0) {
+            player->ownWindow = attempts[a].ownWindow;
             if (a > 0) {
                 NUVIO_ERR("gpu-context %s failed to initialize; using %s instead",
                           attempts[0].ctx, attempts[a].ctx);
@@ -1701,6 +2170,12 @@ JNIEXPORT jlong JNICALL NP(create)(
         return 0;
     }
     NUVIO_LOG("mpv initialized OK");
+    if (player->ownWindow) {
+        NUVIO_ERR("Wayland HDR mode: mpv owns its window (vo=gpu-next, waylandvk)");
+        installOwnWindowInput(player->mpv);
+        mpv_observe_property(player->mpv, kObserveMousePos, "mouse-pos", MPV_FORMAT_NODE);
+        mpv_observe_property(player->mpv, kObserveFullscreen, "fullscreen", MPV_FORMAT_FLAG);
+    }
 
     if (eventSink != nullptr) {
         player->eventSink = env->NewGlobalRef(eventSink);
