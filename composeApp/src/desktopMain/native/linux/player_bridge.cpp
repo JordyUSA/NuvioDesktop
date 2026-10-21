@@ -146,6 +146,10 @@ struct Player {
     // indexed [alpha][channel], rebuilt when the factor changes.
     std::vector<uint8_t> dimLut;
     float dimLutFactor = 1.0f;
+    // Reused dimmed-snapshot buffers (a 4K frame is 33MB; allocating one per
+    // tick page-faults it in every time). A buffer is free again once only the
+    // pool holds a reference, i.e. it is neither snapSurf nor snapSurfPrev.
+    cairo_surface_t *dimPool[3] = {nullptr, nullptr, nullptr};
 };
 
 // ---- Player liveness -----------------------------------------------------
@@ -616,11 +620,17 @@ double linearToSrgb(double v) {
 // Wayland HDR mode: while mpv outputs PQ, scale the controls snapshot so its
 // white lands on the compositor's SDR white instead of libplacebo's fixed
 // 203 nits (see Player::hdrOutput). Scaling happens in linear light on the
-// un-premultiplied colour, via a table built once per factor.
-void dimSnapshotForHdr(Player *player, cairo_surface_t *surf) {
-    if (!player->ownWindow || !player->hdrOutput.load()) return;
+// un-premultiplied colour, via a table built once per factor. WebKit's
+// snapshot pixels are mapped read-only, so the dimmed copy goes into a new
+// surface; returns surf itself (no dimming needed) or that new surface, in
+// which case surf has been released.
+cairo_surface_t *dimSnapshotForHdr(Player *player, cairo_surface_t *surf) {
+    if (!player->ownWindow || !player->hdrOutput.load()) return surf;
     float factor = player->sdrWhiteNits.load() / 203.0f;
-    if (factor >= 0.999f || factor <= 0.0f) return;
+    if (factor >= 0.995f || factor <= 0.0f) return surf;
+    // Quantize so dragging the brightness slider (KWin sends a new reference
+    // luminance per step) does not rebuild the table on every snapshot.
+    factor = std::round(factor * 200.0f) / 200.0f;
     if (player->dimLut.empty() || player->dimLutFactor != factor) {
         player->dimLut.assign(256 * 256, 0);
         for (int a = 1; a < 256; ++a) {
@@ -632,23 +642,67 @@ void dimSnapshotForHdr(Player *player, cairo_surface_t *surf) {
         }
         player->dimLutFactor = factor;
     }
-    const uint8_t *lut = player->dimLut.data();
-    unsigned char *data = cairo_image_surface_get_data(surf);
     int w = cairo_image_surface_get_width(surf);
     int h = cairo_image_surface_get_height(surf);
-    int stride = cairo_image_surface_get_stride(surf);
-    for (int y = 0; y < h; ++y) {
-        uint32_t *row = reinterpret_cast<uint32_t *>(data + (size_t)y * stride);
-        for (int x = 0; x < w; ++x) {
-            uint32_t px = row[x];
-            uint32_t a = px >> 24;
-            if (!a) continue;  // most of the frame is fully transparent
-            const uint8_t *t = lut + a * 256;
-            row[x] = (a << 24) | ((uint32_t)t[(px >> 16) & 0xff] << 16) |
-                     ((uint32_t)t[(px >> 8) & 0xff] << 8) | t[px & 0xff];
+    cairo_surface_t *out = nullptr;
+    for (cairo_surface_t *&slot : player->dimPool) {
+        if (slot && cairo_surface_get_reference_count(slot) == 1 &&
+            (cairo_image_surface_get_width(slot) != w ||
+             cairo_image_surface_get_height(slot) != h)) {
+            cairo_surface_destroy(slot);  // stale size after a resize
+            slot = nullptr;
+        }
+        if (!out && slot && cairo_surface_get_reference_count(slot) == 1) out = slot;
+    }
+    if (!out) {
+        for (cairo_surface_t *&slot : player->dimPool) {
+            if (slot) continue;
+            slot = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+            if (cairo_surface_status(slot) != CAIRO_STATUS_SUCCESS) {
+                cairo_surface_destroy(slot);
+                slot = nullptr;
+            } else {
+                out = slot;
+            }
+            break;
         }
     }
-    cairo_surface_mark_dirty(surf);
+    if (!out) return surf;  // undimmed beats no controls
+    cairo_surface_reference(out);  // the caller's reference; the pool keeps its own
+    const uint8_t *lut = player->dimLut.data();
+    const unsigned char *src = cairo_image_surface_get_data(surf);
+    unsigned char *dst = cairo_image_surface_get_data(out);
+    int srcStride = cairo_image_surface_get_stride(surf);
+    int dstStride = cairo_image_surface_get_stride(out);
+    auto dimRows = [=](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const uint32_t *in = reinterpret_cast<const uint32_t *>(src + (size_t)y * srcStride);
+            uint32_t *row = reinterpret_cast<uint32_t *>(dst + (size_t)y * dstStride);
+            for (int x = 0; x < w; ++x) {
+                uint32_t px = in[x];
+                uint32_t a = px >> 24;
+                if (!a) {  // most of the frame is fully transparent
+                    row[x] = 0;
+                    continue;
+                }
+                const uint8_t *t = lut + a * 256;
+                row[x] = (a << 24) | ((uint32_t)t[(px >> 16) & 0xff] << 16) |
+                         ((uint32_t)t[(px >> 8) & 0xff] << 8) | t[px & 0xff];
+            }
+        }
+    };
+    // Split across cores: this runs on the GTK thread, which also drives the
+    // controls page, so a single-threaded 4K pass made the UI stutter.
+    unsigned n = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> workers;
+    for (unsigned i = 1; i < n; ++i) {
+        workers.emplace_back(dimRows, (int)((size_t)h * i / n), (int)((size_t)h * (i + 1) / n));
+    }
+    dimRows(0, (int)(h / n));
+    for (auto &t : workers) t.join();
+    cairo_surface_mark_dirty(out);
+    cairo_surface_destroy(surf);
+    return out;
 }
 
 // Completion of the async controls snapshot: hand the premultiplied BGRA pixels
@@ -700,7 +754,7 @@ void onOverlaySnapshot(GObject *src, GAsyncResult *res, gpointer data) {
         }
     }
     cairo_surface_flush(surf);
-    dimSnapshotForHdr(player, surf);
+    surf = dimSnapshotForHdr(player, surf);
     char addr[32], sw[16], sh[16], sstride[16];
     snprintf(addr, sizeof addr, "&%zu",
              (size_t)(uintptr_t)cairo_image_surface_get_data(surf));
@@ -1894,6 +1948,10 @@ gboolean destroyWebviewOnGtk(gpointer data) {
     // onOverlayDestroyed) the block above is skipped, but the snapshot
     // surfaces still need freeing.
     releaseSnapshots(player);
+    for (cairo_surface_t *&slot : player->dimPool) {
+        if (slot) cairo_surface_destroy(slot);
+        slot = nullptr;
+    }
     if (player->cursorVisible) {
         g_object_unref(player->cursorVisible);
         player->cursorVisible = nullptr;
